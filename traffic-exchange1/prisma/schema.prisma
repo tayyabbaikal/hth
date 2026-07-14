@@ -1,0 +1,261 @@
+// Prisma schema — normalized data model for the traffic-exchange platform.
+// Source of truth for credits is the CreditTransaction ledger; User.credits is
+// a denormalized cache always updated inside the same DB transaction.
+//
+// Database: MySQL / MariaDB (cPanel-provided). String columns that can exceed
+// MySQL's 191-char index/default limit are widened with @db.Text / @db.VarChar.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum CampaignStatus {
+  PENDING // awaiting admin approval (if moderation enabled)
+  ACTIVE
+  PAUSED
+  COMPLETED // escrow pool fully consumed
+  REJECTED
+  DELETED
+}
+
+enum VisitStatus {
+  PENDING // token issued, awaiting valid callback
+  COMPLETED // rewarded
+  EXPIRED // token TTL passed before callback
+  REJECTED // failed anti-cheat validation
+}
+
+enum TxType {
+  EARN // viewer rewarded for a completed visit
+  SPEND // credits reserved when a campaign is created
+  REFUND // unused escrow returned (e.g. campaign deleted)
+  REFERRAL // referral bonus
+  ADMIN_ADJUST // manual credit change by admin
+  SIGNUP_BONUS
+}
+
+enum NotificationType {
+  CAMPAIGN_COMPLETED
+  CREDITS_EARNED
+  CAMPAIGN_APPROVED
+  CAMPAIGN_REJECTED
+  SECURITY_ALERT
+  REFERRAL_BONUS
+  SYSTEM
+}
+
+enum FraudType {
+  DUPLICATE_IP
+  REPLAY_TOKEN
+  TOKEN_TAMPERED
+  TIMER_TOO_FAST
+  RATE_LIMIT
+  SELF_VISIT
+  DAILY_LIMIT
+  PROXY_VPN
+  BOT_SUSPECTED
+  IDENTITY_MISMATCH
+}
+
+enum VerificationType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+// ---------------------------------------------------------------------------
+// Core entities
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique @db.VarChar(191)
+  passwordHash String    @db.VarChar(191)
+  emailVerified DateTime?
+  role         Role      @default(USER)
+
+  // Denormalized balances (authoritative ledger = CreditTransaction).
+  credits     Int @default(0)
+  totalEarned Int @default(0)
+  totalSpent  Int @default(0)
+
+  banned       Boolean @default(false)
+  bannedReason String? @db.VarChar(255)
+
+  // Referral graph.
+  referralCode String  @unique @db.VarChar(40)
+  referredById String?
+  referredBy   User?   @relation("UserReferrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referrals    User[]  @relation("UserReferrals")
+
+  // Anti-fraud: bind account to signup network fingerprint.
+  signupIpHash String? @db.VarChar(191)
+
+  campaigns    Campaign[]
+  visits       Visit[]              @relation("ViewerVisits")
+  transactions CreditTransaction[]
+  notifications Notification[]
+  fraudLogs    FraudLog[]
+  verifications VerificationToken[]
+  referralBonusesGiven Referral[]   @relation("Referrer")
+  referralBonusReceived Referral?   @relation("Referred")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([referredById])
+}
+
+model Campaign {
+  id      String @id @default(cuid())
+  userId  String
+  owner   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  shortUrl String  @db.Text
+  title    String? @db.VarChar(191)
+
+  status CampaignStatus @default(ACTIVE)
+
+  // Escrow model: creditsAllocated is reserved (spent) from the owner at
+  // creation; each completed visit consumes costPerVisit from the pool.
+  creditsAllocated Int
+  creditsSpent     Int @default(0)
+  costPerVisit     Int @default(1)
+
+  // Minimum seconds a viewer must dwell before a callback is accepted.
+  minTimerSec Int @default(10)
+
+  visits Visit[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([userId])
+}
+
+// A Visit doubles as the single-use token record (the anti-cheat core).
+model Visit {
+  id       String @id @default(cuid())
+  jti      String @unique @db.VarChar(191) // token id embedded in the signed visit token
+
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  viewerId String
+  viewer   User   @relation("ViewerVisits", fields: [viewerId], references: [id], onDelete: Cascade)
+
+  status VisitStatus @default(PENDING)
+
+  ipHash      String  @db.VarChar(191)
+  fingerprint String? @db.VarChar(255)
+
+  rewardAmount Int      @default(0)
+  consumed     Boolean  @default(false) // flipped exactly once on valid callback
+  expiresAt    DateTime
+  startedAt    DateTime @default(now())
+  completedAt  DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([viewerId, campaignId, status])
+  @@index([campaignId, status])
+  @@index([expiresAt])
+  // Prevents a viewer from holding two live tokens for the same campaign.
+  @@index([viewerId, createdAt])
+}
+
+// Immutable append-only ledger. Balance is derived; balanceAfter cached.
+model CreditTransaction {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  amount       Int // signed: +earn, -spend
+  type         TxType
+  balanceAfter Int
+  referenceId  String? @db.VarChar(191) // campaign id, visit id, referral id, etc.
+  meta         Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([type])
+}
+
+model Referral {
+  id             String @id @default(cuid())
+  referrerId     String
+  referrer       User   @relation("Referrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  referredUserId String @unique
+  referredUser   User   @relation("Referred", fields: [referredUserId], references: [id], onDelete: Cascade)
+
+  bonusAwarded Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  @@index([referrerId])
+}
+
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type  NotificationType
+  title String  @db.VarChar(191)
+  body  String  @db.Text
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt])
+}
+
+model FraudLog {
+  id     String  @id @default(cuid())
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  ipHash String?   @db.VarChar(191)
+  type   FraudType
+  detail String    @db.Text
+  meta   Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([type, createdAt])
+  @@index([userId])
+}
+
+// Simple key/value store for admin-configurable settings.
+model AdminSetting {
+  key       String   @id @db.VarChar(191)
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt
+}
+
+model VerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique @db.VarChar(191) // sha256 of the emailed token; raw never stored
+  type      VerificationType
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId, type])
+}
